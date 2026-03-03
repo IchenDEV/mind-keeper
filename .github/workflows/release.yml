@@ -1,0 +1,114 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build & Release
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version from tag
+        id: version
+        run: echo "value=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Check secrets availability
+        id: secrets-check
+        run: |
+          if [ "${{ secrets.APPLE_CERTIFICATE_P12 }}" != '' ]; then
+            echo "has-cert=true" >> "$GITHUB_OUTPUT"
+          fi
+          if [ "${{ secrets.APPLE_ID }}" != '' ] && [ "${{ secrets.APPLE_TEAM_ID }}" != '' ]; then
+            echo "has-notarize=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Import code-signing certificate
+        if: steps.secrets-check.outputs.has-cert == 'true'
+        env:
+          APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          CERT_PATH="$RUNNER_TEMP/certificate.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain-db"
+          KEYCHAIN_PASS="$(openssl rand -hex 16)"
+
+          echo "$APPLE_CERTIFICATE_P12" | base64 --decode > "$CERT_PATH"
+
+          security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: \
+            -k "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+
+          CERT_PEM="$RUNNER_TEMP/cert.pem"
+          openssl pkcs12 -in "$CERT_PATH" -clcerts -nokeys \
+            -passin "pass:${APPLE_CERTIFICATE_PASSWORD}" -out "$CERT_PEM" 2>/dev/null || true
+          if [ -f "$CERT_PEM" ]; then
+            sudo security add-trusted-cert -d -r trustRoot \
+              -k "$KEYCHAIN_PATH" "$CERT_PEM" 2>/dev/null || true
+            rm -f "$CERT_PEM"
+          fi
+
+          security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain-db
+          rm -f "$CERT_PATH"
+
+          IDENTITY=$(security find-identity -p codesigning "$KEYCHAIN_PATH" \
+            | grep '"' | head -1 | sed 's/.*"\(.*\)".*/\1/')
+
+          if [ -n "$IDENTITY" ]; then
+            echo "SIGN_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+            echo "✓ Signing identity: $IDENTITY"
+          else
+            echo "⚠ No codesigning identity found, will use ad-hoc"
+          fi
+
+      # ── Build ──────────────────────────────────────────────────
+      - name: Build .app and .dmg
+        run: |
+          ARGS=(--version="${{ steps.version.outputs.value }}")
+          if [ -n "${SIGN_IDENTITY:-}" ]; then
+            ARGS+=(--sign="${SIGN_IDENTITY}")
+          fi
+          ./scripts/build-app.sh "${ARGS[@]}"
+
+      - name: Verify artifacts
+        run: |
+          ls -lh dist/
+          codesign -dvv "dist/Mind Keeper.app"
+
+      # ── Notarize (optional) ────────────────────────────────────
+      - name: Notarize DMG
+        if: steps.secrets-check.outputs.has-notarize == 'true'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          DMG="dist/MindKeeper-${{ steps.version.outputs.value }}.dmg"
+          xcrun notarytool submit "$DMG" \
+            --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_PASSWORD" \
+            --wait --timeout 30m
+          xcrun stapler staple "$DMG"
+
+      # ── Release ────────────────────────────────────────────────
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Mind Keeper ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            dist/MindKeeper-*.dmg
